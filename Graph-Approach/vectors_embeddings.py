@@ -11,6 +11,7 @@ from sklearn.decomposition import PCA
 from sklearn.metrics import mean_squared_error
 from scipy.spatial.distance import cdist
 from scipy.stats import entropy
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 # Define custom stop words
 stop_words = set([
@@ -100,25 +101,23 @@ def build_word_document_graph(documents, labels, top_words):
     
     return graph_of_docs
 
-
-def create_class_importance_nodes(graph_of_docs, labels):
-    """Calculate class importance scores for each word node, with an array for each class."""
-    class_importance = defaultdict(lambda: [0] * 20)  # Assuming there are 20 classes
-
+def create_class_importance_nodes(graph_of_docs, labels, alpha=0):
+    """Calculate class importance scores for each word node using Laplace smoothing."""
+    num_classes = len(set(labels))
+    class_importance = defaultdict(lambda: [0] * num_classes)
+    
+    # Aggregate class counts for each word node
     for node in graph_of_docs:
-        # Process only document nodes
         if 'doc_' in node:
             doc_index = int(node.split('_')[1])
-            label = labels[doc_index]  # Get the class label for the document
-            
-            # Update class importance for each word connected to this document
+            label = labels[doc_index]
             for neighbor in graph_of_docs.neighbors(node):
                 class_importance[neighbor][label] += 1
+
+    # Apply Laplace smoothing and normalize
+    for word, counts in class_importance.items():
+        class_importance[word] = apply_laplace_smoothing(counts, alpha, num_classes)
     
-    for word, importance_array in class_importance.items():
-        total = sum(importance_array)
-        if total > 0:
-            class_importance[word] = [count / total for count in importance_array]
     return class_importance
 
 def zero_class_importance(class_importances, class_to_zero):
@@ -161,6 +160,29 @@ def train_classifier(class_importance, top_words):
         return predicted_class
 
     return classify_document
+
+def remove_high_importance_words(graph_of_docs, class_importance, unlearned_class, threshold):
+    """
+    Remove word nodes with class importance greater than the specified threshold for the unlearned class.
+    """
+    nodes_to_remove = []
+
+    # Identify word nodes to remove
+    for word, importance_array in class_importance.items():
+        if importance_array[unlearned_class] >= threshold:
+            nodes_to_remove.append(word)
+
+    # Remove identified nodes from the graph
+    graph_of_docs.remove_nodes_from(nodes_to_remove)
+
+    print(f"Removed {len(nodes_to_remove)} nodes with high importance for class {unlearned_class}.")
+    return graph_of_docs, nodes_to_remove
+
+def apply_laplace_smoothing(class_counts, alpha, num_classe):
+    """Apply Laplace smoothing to an array of class counts."""
+    smoothed_counts = [count + alpha for count in class_counts]
+    total = sum(smoothed_counts)
+    return [count / total for count in smoothed_counts]
 
 def compute_centroids(class_importance, documents, labels, top_words):
     """Compute centroids for each class and the entire dataset."""
@@ -221,6 +243,37 @@ def cluster_density(data, labels, target_label):
     pairwise_distances = cdist(class_data, class_data, metric='euclidean')
     return np.mean(pairwise_distances)
 
+def tsne_visualization(documents, labels, class_importance, class_to_zero):
+    """Visualize document embeddings using t-SNE."""
+    embeddings = []
+    color_map = []  # To distinguish unlearned and other classes
+    for idx, doc in enumerate(documents):
+        words = set(clean_data(doc))
+        doc_vector = np.zeros(20)  # 20 classes
+
+        for word in words:
+            if word in class_importance:
+                doc_vector += np.array(class_importance[word])
+        
+        doc_vector /= len(words) if len(words) > 0 else 1  # Normalize by the number of words
+        embeddings.append(doc_vector)
+
+        if labels[idx] == class_to_zero:
+            color_map.append('red')
+        else:
+            color_map.append('blue')
+
+    embeddings = np.array(embeddings)
+    tsne = TSNE(n_components=2, perplexity=30, random_state=42)
+    tsne_results = tsne.fit_transform(embeddings)
+
+    plt.figure(figsize=(10, 7))
+    plt.scatter(tsne_results[:, 0], tsne_results[:, 1], c=color_map, alpha=0.6)
+    plt.title(f"t-SNE Visualization: Class {class_to_zero} in Red")
+    plt.xlabel("t-SNE Dimension 1")
+    plt.ylabel("t-SNE Dimension 2")
+    plt.show()
+
 def main():
     # Load dataset
     dataset = load_20newsgroup_dataset()
@@ -236,6 +289,11 @@ def main():
     class_to_zero = random.randint(0, 19)
     print(f"Unlearned Class: {class_to_zero}")
 
+    # Convert text data to numerical vectors using TF-IDF
+    vectorizer = TfidfVectorizer(max_features=5000)  # Limit to 5000 features for efficiency
+    train_dataset_vector = vectorizer.fit_transform(train_dataset).toarray()
+    test_dataset_vector = vectorizer.transform(test_dataset).toarray()
+
     # Create word graph
     word_graph = create_word_graph(train_dataset)
 
@@ -248,7 +306,6 @@ def main():
     # Create class importance nodes
     class_importance = create_class_importance_nodes(graph_of_docs, labels)
 
-
     classify_document = train_classifier(class_importance, top_words)
 
     # Predict and evaluate on the test set
@@ -257,12 +314,17 @@ def main():
     print(f"Accuracy on entire test data before unlearning: {accuracy_all * 100:.2f}%")
 
     centroids_before = compute_centroids(class_importance, test_dataset, y_test_labels, top_words)
-    pca_data_before, pca_model_before = apply_pca(test_dataset, n_components=2)
+    pca_data_before, pca_model_before = apply_pca(test_dataset_vector, n_components=2)
     density_before = cluster_density(pca_data_before, y_test_labels, class_to_zero)
     
+    tsne_visualization(test_dataset, y_test_labels, class_importance, class_to_zero)
+
     #Unlearning process
 
-    # Adjust class im6portance scores
+    # Remove high-importance words for the unlearned class
+    graph_of_docs, removed_words = remove_high_importance_words(graph_of_docs, class_importance, class_to_zero, threshold=0.05)
+
+    # Adjust class importance scores
     class_importance = zero_class_importance(class_importance, class_to_zero)
 
     # Train custom classifier with adjusted class importance scores
@@ -282,7 +344,7 @@ def main():
     print(f"Accuracy excluding class {class_to_zero}: {accuracy_excl * 100:.2f}%")
 
     centroids_after = compute_centroids(class_importance, test_dataset, y_test_labels, top_words)
-    pca_data_after, pca_model_after = apply_pca(test_dataset, n_components=2)
+    pca_data_after, pca_model_after = apply_pca(test_dataset_vector, n_components=2)
     density_after = cluster_density(pca_data_after, y_test_labels, class_to_zero)
 
     distance_before = centroids_before["class_avg_distances"].get(class_to_zero, None)
@@ -293,6 +355,8 @@ def main():
 
     print("Cluster Density (Before Unlearning):", density_before)
     print("Cluster Density (After Unlearning):", density_after)
+
+    tsne_visualization(test_dataset, y_test_labels, class_importance, class_to_zero)
 
 # Run the main function
 if __name__ == "__main__":
