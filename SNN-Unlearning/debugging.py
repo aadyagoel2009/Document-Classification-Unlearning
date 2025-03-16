@@ -19,8 +19,11 @@ class NewsGroupDataset(Dataset):
 
     def text_pipeline(self, text):
         tokenized = self.tokenizer(text)
+        # Use the provided vocab mapping; if token not found, use <unk>
         indexed = [self.vocab[token] if token in self.vocab else self.vocab["<unk>"] for token in tokenized]
-        return torch.tensor(indexed[:self.max_length] + [0] * (self.max_length - len(indexed)), dtype=torch.long)
+        # Pad/truncate to fixed length
+        padded = indexed[:self.max_length] + [0] * (self.max_length - len(indexed))
+        return torch.tensor(padded, dtype=torch.long)
 
     def __len__(self):
         return len(self.texts)
@@ -51,7 +54,9 @@ class DataLoader20Newsgroups:
         def yield_tokens(data_iter):
             for text in data_iter:
                 yield self.tokenizer(text)
-        return build_vocab_from_iterator(yield_tokens(self.train_texts), specials=["<unk>"])
+        # Build vocabulary with a special token for unknown words.
+        vocab = build_vocab_from_iterator(yield_tokens(self.train_texts), specials=["<unk>"])
+        return vocab
 
     def get_dataloader(self, split="train"):
         dataset = self.train_dataset if split == "train" else self.test_dataset
@@ -67,9 +72,19 @@ class TextCNNModel(nn.Module):
         self.dropout = nn.Dropout(0.5)
     
     def forward(self, x):
-        x = self.embedding(x).permute(0, 2, 1)
-        x = [conv(x)[0].detach().max(dim=2)[0] if isinstance(conv(x), tuple) else torch.relu(conv(x)).max(dim=2)[0] for conv in self.conv_layers]
-        x = torch.cat(x, dim=1)
+        # x shape: (batch, seq_length)
+        x = self.embedding(x)       # (batch, seq_length, embed_dim)
+        x = x.permute(0, 2, 1)        # (batch, embed_dim, seq_length)
+        conv_results = []
+        for conv in self.conv_layers:
+            out = conv(x)           # Compute conv once
+            # If the conv layer is already wrapped (SNN conversion), skip extra activation.
+            if isinstance(conv, nn.Sequential):
+                out = out.max(dim=2)[0]
+            else:
+                out = torch.relu(out).max(dim=2)[0]
+            conv_results.append(out)
+        x = torch.cat(conv_results, dim=1)
         x = self.dropout(x)
         return self.fc(x)
 
@@ -82,14 +97,15 @@ class SNNConverter:
     def create_snn(self, num_classes):
         """Convert a trained CNN to an SNN by replacing ReLU with LIF neurons."""
         snn_model = self.textcnn
+        # Load the pretrained CNN weights
         snn_model.load_state_dict(torch.load("textcnn_20news.pth"))
         self.normalize_weights(snn_model)
         
-        # Convert ReLU layers into LIF neurons
+        # Replace each convolutional layer with a sequential block that includes a spiking neuron.
         for i in range(len(snn_model.conv_layers)):
             snn_model.conv_layers[i] = nn.Sequential(
-                snn_model.conv_layers[i],  # Conv layer
-                nn.ReLU(),  # Ensure ReLU is explicitly defined
+                snn_model.conv_layers[i],         # Convolution layer
+                nn.ReLU(),                        # Ensure ReLU is explicitly defined (for compatibility)
                 snn.Leaky(beta=0.95, threshold=1.0, spike_grad=snn.surrogate.fast_sigmoid(slope=25))
             )
         
@@ -99,11 +115,14 @@ class SNNConverter:
         """Normalize CNN weights before conversion to an SNN."""
         with torch.no_grad():
             for i in range(len(self.textcnn.conv_layers)):
-                max_act = torch.max(torch.abs(self.textcnn.conv_layers[i].weight)).item()
-                if max_act > 0:  # Avoid division by zero
-                    snn_model.conv_layers[i].weight.data /= max_act
-                    if snn_model.conv_layers[i].bias is not None:
-                        snn_model.conv_layers[i].bias.data /= max_act
+                # Access weights from the original Conv1d layers
+                conv_layer = self.textcnn.conv_layers[i]
+                # For unwrapped conv layers
+                max_val = torch.max(torch.abs(conv_layer.weight)).item()
+                if max_val > 0:
+                    conv_layer.weight.data /= max_val
+                    if conv_layer.bias is not None:
+                        conv_layer.bias.data /= max_val
 
     def fine_tune_snn(self, train_loader, lr=0.001, epochs=5):
         """Fine-tune the SNN after conversion using surrogate gradient learning."""
@@ -123,9 +142,9 @@ class SNNConverter:
                 loss.backward()
                 optimizer.step()
                 total_loss += loss.item()
-                correct += (outputs.argmax(1) == labels).sum().item()
+                correct += (outputs.argmax(dim=1) == labels).sum().item()
             
-            print(f"SNN Epoch {epoch+1}, Loss: {total_loss/len(train_loader)}, Accuracy: {correct/len(train_loader.dataset):.4f}")
+            print(f"SNN Epoch {epoch+1}, Loss: {total_loss/len(train_loader):.4f}, Accuracy: {correct/len(train_loader.dataset):.4f}")
         
         torch.save(self.snn.state_dict(), "snn_20news.pth")
 
@@ -140,7 +159,7 @@ class SNNConverter:
             for texts, labels in test_loader:
                 texts, labels = texts.to(device), labels.to(device)
                 outputs = self.snn(texts)
-                predicted = torch.argmax(outputs, dim=1)
+                predicted = outputs.argmax(dim=1)
                 correct += (predicted == labels).sum().item()
                 total += labels.size(0)
         
@@ -172,6 +191,7 @@ def main():
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
+    # Save the trained CNN weights
     torch.save(textcnn.state_dict(), "textcnn_20news.pth")
     
     # Convert and Fine-tune SNN
