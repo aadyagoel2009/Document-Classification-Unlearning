@@ -8,6 +8,7 @@ from sklearn.manifold import TSNE
 import re
 import random
 from sklearn.decomposition import PCA
+from collections import Counter
 from sklearn.metrics import mean_squared_error
 from scipy.spatial.distance import cdist
 from scipy.stats import entropy
@@ -142,19 +143,20 @@ def train_classifier(class_importance, top_words):
     """Create a custom classifier using the normalized class importance scores."""
 
     def classify_document(document):
-        """Classify a document by averaging class importance scores of words it contains."""
-        words = set(clean_data(document))
+        """Classify a document by computing a frequency-weighted average of keyword class importance scores."""
+        words = clean_data(document)  # keep duplicates
+        word_counts = Counter(words)
         class_scores = [0] * 20  # Initialize scores for each class
-        relevant_words = 0
+        total_weight = 0
 
-        for word in words:
+        for word, count in word_counts.items():
             if word in top_words and word in class_importance:
                 for cls in range(20):
-                    class_scores[cls] += class_importance[word][cls]
-                relevant_words += 1
+                    class_scores[cls] += class_importance[word][cls] * count
+                total_weight += count
 
-        if relevant_words > 0:
-            class_scores = [score / relevant_words for score in class_scores]
+        if total_weight > 0:
+            class_scores = [score / total_weight for score in class_scores]
         
         predicted_class = class_scores.index(max(class_scores))
         return predicted_class
