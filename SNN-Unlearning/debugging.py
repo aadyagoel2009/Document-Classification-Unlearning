@@ -77,18 +77,20 @@ class TextCNNModel(nn.Module):
         x = x.permute(0, 2, 1)        # (batch, embed_dim, seq_length)
         conv_results = []
         for conv in self.conv_layers:
-            out = conv(x)           # Compute conv once
-            # If the conv layer is already wrapped (SNN conversion), skip extra activation.
-            if isinstance(conv, nn.Sequential):
-                out = out.max(dim=2)[0]
-            else:
-                out = torch.relu(out).max(dim=2)[0]
+            out = conv(x)
+            # Recursively unwrap tuples if necessary
+            while isinstance(out, tuple):
+                out = out[0]
+            # If conv layer is not wrapped in Sequential (i.e., not converted to SNN), apply ReLU activation.
+            if not isinstance(conv, nn.Sequential):
+                out = torch.relu(out)
+            out = out.max(dim=2)[0]
             conv_results.append(out)
         x = torch.cat(conv_results, dim=1)
         x = self.dropout(x)
         return self.fc(x)
 
-# Convert to SNN
+#Convert to SNN
 class SNNConverter:
     def __init__(self, textcnn_model, num_classes):
         self.textcnn = textcnn_model
@@ -114,18 +116,28 @@ class SNNConverter:
     def normalize_weights(self, snn_model):
         """Normalize CNN weights before conversion to an SNN."""
         with torch.no_grad():
-            for i in range(len(self.textcnn.conv_layers)):
-                # Access weights from the original Conv1d layers
-                conv_layer = self.textcnn.conv_layers[i]
-                # For unwrapped conv layers
-                max_val = torch.max(torch.abs(conv_layer.weight)).item()
+            for i in range(len(snn_model.conv_layers)):
+                conv_layer = snn_model.conv_layers[i]
+                # If the conv layer is wrapped in Sequential, get the actual Conv1d layer.
+                if isinstance(conv_layer, nn.Sequential):
+                    conv = conv_layer[0]
+                else:
+                    conv = conv_layer
+                max_val = torch.max(torch.abs(conv.weight)).item()
                 if max_val > 0:
-                    conv_layer.weight.data /= max_val
-                    if conv_layer.bias is not None:
-                        conv_layer.bias.data /= max_val
+                    conv.weight.data /= max_val
+                    if conv.bias is not None:
+                        conv.bias.data /= max_val
+
+    def reset_spiking_states(self, model):
+        # Iterate over all submodules and reset any spiking neuron state if the method is callable.
+        for module in model.modules():
+            if hasattr(module, "reset_state") and callable(module.reset_state):
+                module.reset_state()
+            elif hasattr(module, "reset") and callable(module.reset):
+                module.reset()
 
     def fine_tune_snn(self, train_loader, lr=0.001, epochs=5):
-        """Fine-tune the SNN after conversion using surrogate gradient learning."""
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.snn.to(device)
         optimizer = torch.optim.Adam(self.snn.parameters(), lr=lr)
@@ -135,15 +147,18 @@ class SNNConverter:
             self.snn.train()
             total_loss, correct = 0, 0
             for texts, labels in train_loader:
-                texts, labels = texts.to(device), labels.to(device)
+                # Reset spiking neuron states at the start of each batch
+                self.reset_spiking_states(self.snn)
+
                 optimizer.zero_grad()
                 outputs = self.snn(texts)
                 loss = criterion(outputs, labels)
                 loss.backward()
                 optimizer.step()
+
                 total_loss += loss.item()
                 correct += (outputs.argmax(dim=1) == labels).sum().item()
-            
+
             print(f"SNN Epoch {epoch+1}, Loss: {total_loss/len(train_loader):.4f}, Accuracy: {correct/len(train_loader.dataset):.4f}")
         
         torch.save(self.snn.state_dict(), "snn_20news.pth")

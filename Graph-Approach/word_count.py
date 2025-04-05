@@ -102,7 +102,7 @@ def build_word_document_graph(documents, labels, top_words):
     
     return graph_of_docs
 
-def create_class_importance_nodes(graph_of_docs, labels, alpha=0):
+def create_class_importance_nodes(graph_of_docs, labels, alpha=2):
     """Calculate class importance scores for each word node using Laplace smoothing."""
     num_classes = len(set(labels))
     class_importance = defaultdict(lambda: [0] * num_classes)
