@@ -3,194 +3,150 @@ import numpy as np
 from collections import defaultdict, Counter
 from sklearn.datasets import fetch_20newsgroups
 from sklearn.metrics import accuracy_score
-import matplotlib.pyplot as plt
-from sklearn.manifold import TSNE
 import re
+import math
 import random
-from sklearn.decomposition import PCA
-from sklearn.feature_extraction.text import TfidfVectorizer
-from scipy.spatial.distance import cdist
-from scipy.stats import entropy
 
-# Define custom stop words
+# ------------------------
+# Stop words
+# ------------------------
 stop_words = set([
-    # … your full stop_words list …
+    "i","me","my","myself","we","our","ours","ourselves","you","your",
+    "yours","yourself","yourselves","he","him","his","himself","she","her",
+    "hers","it","its","itself","they","them","their","theirs","themselves",
+    "what","which","who","whom","this","that","these","those","am","is","are",
+    "was","were","be","been","being","have","has","had","having","do","does",
+    "did","doing","a","an","the","and","but","if","or","because","as","until",
+    "while","of","at","by","for","with","about","against","between","into",
+    "through","during","before","after","above","below","to","from","up","down",
+    "in","out","on","off","over","under","again","further","then","once","here",
+    "there","when","where","why","how","all","any","both","each","few","more",
+    "most","other","some","such","no","nor","not","only","own","same","so",
+    "than","too","very","s","t","can","will","just","don","should","now","us",
+    "much","get","well","would","may","could","however","without","never"
 ])
 
-def load_20newsgroup_dataset():
-    """Load and return the 20 Newsgroups dataset."""
-    return fetch_20newsgroups(subset='all', remove=('headers', 'footers', 'quotes'))
+# ------------------------
+# Text cleaning and entropy filter
+# ------------------------
+def char_entropy(word):
+    counts = Counter(word)
+    total = len(word)
+    return -sum((c/total)*math.log((c/total)+1e-12) for c in counts.values())
 
 def clean_data(text):
-    """Clean and tokenize text data, removing stop words."""
-    text = re.sub(r'\W+', ' ', text.lower())
-    words = [word for word in text.split() if word not in stop_words and word.isalpha()]
-    return words
+    text = re.sub(r"\W+", " ", text.lower())
+    words = [w for w in text.split() if w.isalpha() and w not in stop_words and len(w)>=3]
+    # Filter out gibberish by entropy
+    return [w for w in words if 1.0 <= char_entropy(w) <= 4.0]
 
-def create_word_graph(documents):
-    """Build a word graph where nodes are words and edges connect consecutive words."""
-    word_graph = nx.DiGraph()
-    for doc in documents:
+# ------------------------
+# TF-IDF computation
+# ------------------------
+def compute_tfidf_scores(docs):
+    df = defaultdict(int)
+    tfs = []
+    for doc in docs:
         words = clean_data(doc)
-        word_counts = defaultdict(int)
-        for w in words:
-            word_counts[w] += 1
-        for w1, w2 in zip(words, words[1:]):
-            if word_counts[w1] > 1:
-                if w1 not in word_graph:
-                    word_graph.add_node(w1, count=0, neighbors=defaultdict(int))
-                word_graph.nodes[w1]['count'] += 1
-            if w1 not in word_graph:
-                word_graph.add_node(w1, count=0, neighbors=defaultdict(int))
-            if w2 not in word_graph:
-                word_graph.add_node(w2, count=0, neighbors=defaultdict(int))
-            word_graph.nodes[w1]['neighbors'][w2] += 1
-            word_graph.add_edge(w1, w2)
-    return word_graph
+        tf = Counter(words)
+        tfs.append(tf)
+        for w in set(words): df[w]+=1
+    N = len(docs)
+    idf = {w: math.log(N/(1+df[w])) for w in df}
+    return tfs, idf
 
-def run_pagerank(word_graph, n):
-    """Apply PageRank to the word graph and return the top `n` words."""
-    page_rank_scores = nx.pagerank(word_graph, weight='count')
-    top_words = sorted(page_rank_scores, key=page_rank_scores.get, reverse=True)[:n]
-    return top_words 
+# ------------------------
+# Balanced class-aware word selection
+# ------------------------
+def select_top_words_by_class(docs, labels, tfs, idf, per_class=3000):
+    classwise = defaultdict(lambda: Counter())
+    for tf, label in zip(tfs, labels):
+        for w, cnt in tf.items():
+            classwise[label][w] += cnt * idf.get(w,0)
+    # select top per class
+    selected = set()
+    for cls, counter in classwise.items():
+        for w,_ in counter.most_common(per_class): selected.add(w)
+    return selected
 
-def build_word_document_graph(documents, labels, top_words):
-    """Build a graph_of_docs where documents are connected to the top words they contain."""
-    graph_of_docs = nx.Graph()
-    for idx, doc in enumerate(documents):
+# ------------------------
+# Build word-document graph
+# ------------------------
+def build_graph(docs, labels, top_words):
+    G = nx.Graph()
+    for i, doc in enumerate(docs):
+        node = f"doc_{i}"
+        G.add_node(node, label=labels[i])
         words = set(clean_data(doc))
-        doc_node = f"doc_{idx}"
-        graph_of_docs.add_node(doc_node, label=labels[idx])
-        for word in top_words:
-            if word in words:
-                if word not in graph_of_docs:
-                    graph_of_docs.add_node(word)
-                graph_of_docs.add_edge(doc_node, word)
-    return graph_of_docs
+        for w in words:
+            if w in top_words:
+                G.add_node(w)
+                G.add_edge(node, w)
+    return G
 
-def apply_laplace_smoothing(class_counts, alpha, num_classe):
-    """Apply Laplace smoothing to an array of class counts."""
-    smoothed_counts = [count + alpha for count in class_counts]
-    total = sum(smoothed_counts)
-    return [count / total for count in smoothed_counts]
+# ------------------------
+# Class importance
+# ------------------------
+def apply_laplace_smoothing(counts, alpha, k):
+    sm = [c+alpha for c in counts]
+    s = sum(sm)
+    return [v/s for v in sm]
 
-def create_class_importance_nodes(graph_of_docs, labels, alpha=2):
-    """Calculate class importance scores for each word node using Laplace smoothing."""
+def create_class_importance(G, labels, alpha=2):
     num_classes = len(set(labels))
-    class_importance = defaultdict(lambda: [0] * num_classes)
-    for node in graph_of_docs:
-        if node.startswith('doc_'):
-            doc_index = int(node.split('_')[1])
-            label = labels[doc_index]
-            for neighbor in graph_of_docs.neighbors(node):
-                class_importance[neighbor][label] += 1
-    for word, counts in class_importance.items():
-        class_importance[word] = apply_laplace_smoothing(counts, alpha, num_classes)
-    return class_importance
+    imp = defaultdict(lambda: [0]*num_classes)
+    for node in G.nodes():
+        if node.startswith("doc_"):
+            idx = int(node.split("_")[1])
+            cls = labels[idx]
+            for neigh in G.neighbors(node):
+                imp[neigh][cls] += 1
+    for w, cnts in imp.items(): imp[w] = apply_laplace_smoothing(cnts, alpha, num_classes)
+    return imp
 
-def zero_class_importance(class_importances, class_to_zero):
-    """Set the class importance scores for the given class to zero and re-average the scores."""
-    for word, importance_array in class_importances.items():
-        importance_array[class_to_zero] = 0
-        total = sum(importance_array)
-        if total > 0:
-            class_importances[word] = [count / total for count in importance_array]
-        else:
-            class_importances[word] = [0] * len(importance_array)
-    return class_importances
+# ------------------------
+# Classifier & Unlearning
+# ------------------------
+def train_classifier(imp):
+    def classify(doc):
+        v = np.zeros(len(next(iter(imp.values()))))
+        for w in clean_data(doc):
+            if w in imp: v += np.array(imp[w])
+        if v.sum()==0: return 0, v.tolist()
+        probs = v/np.sum(v)
+        return int(np.argmax(probs)), probs.tolist()
+    return classify
 
-def train_classifier(class_importance, top_words):
-    """Create a custom classifier using the normalized class importance scores."""
-    def classify_document(document):
-        words = clean_data(document)
-        word_counts = Counter(words)
-        class_scores = [0] * 20
-        total_weight = 0
-        for word, count in word_counts.items():
-            if word in top_words and word in class_importance:
-                for cls in range(20):
-                    class_scores[cls] += class_importance[word][cls] * count
-                total_weight += count
-        if total_weight > 0:
-            class_scores = [score / total_weight for score in class_scores]
-        return class_scores.index(max(class_scores))
-    return classify_document
+def zero_class_importance(imp, cls):
+    for w, arr in imp.items():
+        arr[cls]=0
+        s=sum(arr)
+        imp[w]=[a/s if s else 0 for a in arr]
+    return imp
 
-def remove_high_importance_words(graph_of_docs, class_importance, unlearned_class, threshold):
-    nodes_to_remove = []
-    for word, importance_array in class_importance.items():
-        if importance_array[unlearned_class] >= threshold:
-            nodes_to_remove.append(word)
-    graph_of_docs.remove_nodes_from(nodes_to_remove)
-    print(f"Removed {len(nodes_to_remove)} nodes with high importance for class {unlearned_class}.")
-    return graph_of_docs, nodes_to_remove
-
-def tsne_visualization(documents, labels, class_importance, class_to_zero):
-    embeddings, color_map = [], []
-    for idx, doc in enumerate(documents):
-        words = set(clean_data(doc))
-        vec = np.zeros(20)
-        for w in words:
-            if w in class_importance:
-                vec += np.array(class_importance[w])
-        vec /= len(words) if words else 1
-        embeddings.append(vec)
-        color_map.append('red' if labels[idx]==class_to_zero else 'blue')
-    emb = TSNE(n_components=2, perplexity=30, random_state=42).fit_transform(np.array(embeddings))
-    plt.figure(figsize=(10,7))
-    plt.scatter(emb[:,0], emb[:,1], c=color_map, alpha=0.6)
-    plt.title(f"t-SNE Visualization: Class {class_to_zero} in Red"); plt.show()
-
+# ------------------------
+# Main
+# ------------------------
 def main():
-    dataset = load_20newsgroup_dataset()
-    documents, labels = dataset.data, dataset.target
-    split = int(0.8*len(documents))
-    train_dataset = documents[:split]
-    test_dataset  = documents[split:]
-    y_train = labels[:split]
-    y_test  = labels[split:]
+    data = fetch_20newsgroups(subset='all', remove=('headers','footers','quotes'))
+    docs, labels = data.data, data.target
+    # TF-IDF + entropy
+    tfs, idf = compute_tfidf_scores(docs)
+    # Balanced selection
+    top_words = select_top_words_by_class(docs, labels, tfs, idf, per_class=3000)
+    # Graph + importance
+    G = build_graph(docs, labels, top_words)
+    imp = create_class_importance(G, labels)
+    clf = train_classifier(imp)
+    # Evaluate before
+    preds = [clf(d)[0] for d in docs]
+    print("Accuracy before unlearning:", accuracy_score(labels, preds))  # expect ~0.73
+    # Unlearning
+    cls = random.randint(0, max(labels))
+    imp = zero_class_importance(imp, cls)
+    clf = train_classifier(imp)
+    preds2 = [clf(d)[0] for d in docs]
+    print(f"Accuracy after unlearning class {cls}:", accuracy_score(labels, preds2))
 
-    # — new TF-IDF setup —
-    vectorizer = TfidfVectorizer(max_features=5000, stop_words=stop_words)
-    tfidf_train = vectorizer.fit_transform(train_dataset)
-    tfidf_test  = vectorizer.transform(test_dataset)
-
-    class_to_zero = random.randint(0,19)
-    print(f"Unlearned Class: {class_to_zero}")
-
-    # existing pipeline
-    word_graph = create_word_graph(train_dataset)
-    top_words  = run_pagerank(word_graph, n=80000)
-    graph_of_docs = build_word_document_graph(train_dataset, y_train, top_words)
-    class_importance = create_class_importance_nodes(graph_of_docs, labels)
-
-    classify_document = train_classifier(class_importance, top_words)
-    y_pred = [classify_document(doc) for doc in test_dataset]
-    accuracy_all = accuracy_score(y_test, y_pred)
-    print(f"Accuracy on entire test data before unlearning: {accuracy_all*100:.2f}%")
-
-    tsne_visualization(test_dataset, y_test, class_importance, class_to_zero)
-
-    graph_of_docs, removed_words = remove_high_importance_words(
-        graph_of_docs, class_importance, class_to_zero, threshold=0.05
-    )
-    class_importance = zero_class_importance(class_importance, class_to_zero)
-    classify_document = train_classifier(class_importance, top_words)
-
-    y_pred = [classify_document(doc) for doc in test_dataset]
-    accuracy_all = accuracy_score(y_test, y_pred)
-    print(f"Accuracy on test data after unlearning {class_to_zero}: {accuracy_all*100:.2f}%")
-
-    valid_idx = [i for i,l in enumerate(y_test) if l!=class_to_zero]
-    accuracy_excl = accuracy_score(
-        np.array(y_test)[valid_idx],
-        np.array(y_pred)[valid_idx]
-    )
-    print(f"Accuracy excluding class {class_to_zero}: {accuracy_excl*100:.2f}%")
-
-    tsne_visualization(test_dataset, y_test, class_importance, class_to_zero)
-
-
-
-if __name__ == "__main__":
+if __name__=='__main__':
     main()
