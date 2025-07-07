@@ -179,15 +179,14 @@ def membership_inference_attack(classify_document, train_docs, test_docs, train_
 # Main workflow with DBpedia
 # ------------------------
 def main():
-    dataset = load_20newsgroup_dataset()
-    documents = dataset.data
-    labels = dataset.target
-
-    split_index = int(0.8 * len(documents))
-    train_docs = documents[:split_index]
-    test_docs = documents[split_index:]
-    train_labels = labels[:split_index]
-    test_labels = labels[split_index:]
+    dataset = load_dataset('dbpedia_14')
+    print("dataset loaded")
+    train = dataset['train']
+    test  = dataset['test']
+    train_docs = train['content']
+    train_labels = train['label']
+    test_docs  = test['content']
+    test_labels = test['label']
     print("all partition done")
 
     # word selection
