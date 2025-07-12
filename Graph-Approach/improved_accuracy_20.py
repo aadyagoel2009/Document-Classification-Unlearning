@@ -117,7 +117,9 @@ def train_classifier(imp, idf):
         
         for w, count in tf.items():
             if w in imp:
-                weight = count * idf.get(w, 0.0)
+                tf_log    = 1 + math.log(count)
+                idf_clamp = min(max(idf[w], 0.5), 3.0)
+                weight  = tf_log * idf_clamp
                 vec += weight * np.array(imp[w])
         if vec.sum()== 0: return 0, vec.tolist()
         
@@ -173,7 +175,6 @@ def membership_inference_attack(classify_document, train_docs, test_docs, train_
     atk = LogisticRegression(class_weight='balanced').fit(Xa, ya)
     auc = roc_auc_score(yt, atk.predict_proba(Xt)[:,1])
     return auc
-
 
 # ------------------------
 # Main workflow with DBpedia
