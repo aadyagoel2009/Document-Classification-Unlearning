@@ -22,6 +22,7 @@ import os, json
 from functools import lru_cache
 from keybert import KeyBERT
 from sentence_transformers import SentenceTransformer, util
+from sklearn.model_selection import StratifiedShuffleSplit
 
 
 # ------------------------
@@ -29,7 +30,7 @@ from sentence_transformers import SentenceTransformer, util
 # ------------------------
 
 #Hyperparameters 
-EMB_MODEL          = "sentence-transformers/all-MiniLM-L6-v2"
+EMB_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 KEYWORDS_PER_CLASS = 4000                     # words returned per class
 ENT_MIN, ENT_MAX   = 1.0, 4.0                # entropy gate 
 
@@ -39,6 +40,11 @@ def char_entropy(word):
     counts = Counter(word)
     total = len(word)
     return -sum((c/total)*math.log((c/total)+1e-12) for c in counts.values())
+
+def clean_data(text):
+    text = re.sub(r"\W+", " ", text.lower())
+    words = [w for w in text.split() if w.isalpha() and len(w)>=2]
+    return [w for w in words if 0.5 <= char_entropy(w) <= 5.0]
 
 def build_keywords_per_class(train_docs, train_labels):
     """Return the union of KEYWORDS_PER_CLASS discriminative tokens per class."""
@@ -62,12 +68,32 @@ def build_keywords_per_class(train_docs, train_labels):
                 diversity = 0.7                     
             )
             freq.update(w.lower() for w, _ in kw_scores if ENT_MIN <= char_entropy(w) <= ENT_MAX and w.isascii())
+            print("doc")
         
         # ensure exactly KEYWORDS_PER_CLASS per class
         keywords_by_class[cls] = set([w for w, _ in freq.most_common(KEYWORDS_PER_CLASS)])
+        print(cls)
 
     top_words = sorted(set().union(*keywords_by_class.values()))
     return top_words
+
+def build_doc_kws(doc, k=20):
+    """
+    Return the top-k KeyBERT keywords for a single document.
+    """
+    kws = kw_model.extract_keywords(
+        doc,
+        keyphrase_ngram_range=(1, 3),
+        stop_words="english",
+        top_n=k,
+        use_mmr=True,
+        diversity=0.7
+    )
+    # just the words, filtered by your entropy gate
+    return [
+        w.lower() for w,_ in kws
+        if ENT_MIN <= char_entropy(w) <= ENT_MAX and w.isascii()
+    ]
 
 # ------------------------
 # Build word-document graph
@@ -121,8 +147,7 @@ def train_classifier(imp, word_embeddings, embed_model, idf):
     
     def classify(doc):
         raw = embed_model.encode(
-            doc[:embed_model.max_seq_length],
-            convert_to_numpy=True
+            doc, convert_to_numpy=True, normalize_embeddings=True
         )
         norm = np.linalg.norm(raw)
         doc_emb = raw/norm if norm>0 else raw
@@ -134,13 +159,14 @@ def train_classifier(imp, word_embeddings, embed_model, idf):
             if w in imp:
                 sim = float(np.dot(doc_emb, word_embeddings[w]))
                 sim = max(sim, 0.0)
-
+            
                 tf_log    = 1 + math.log(count)
-                idf_clamp = min(max(idf[w], 0.5), 3.0)
-
-                weight = sim * tf_log * idf_clamp
-
+                weight = sim * tf_log * idf[w]
                 vec += weight * np.array(imp[w])
+
+        for w in build_doc_kws(doc, k=5):
+            if w in imp:
+                vec += 1.0 * np.array(imp[w])
 
         # fallback if no words matched
         if vec.sum() == 0:
@@ -212,20 +238,25 @@ def main():
     documents = dataset.data
     labels = dataset.target
 
-    split_index = int(0.8 * len(documents))
-    train_docs = documents[:split_index]
-    test_docs = documents[split_index:]
-    train_labels = labels[:split_index]
-    test_labels = labels[split_index:]
+    sss = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+    print("startified")
+    train_idx, test_idx = next(sss.split(documents, labels))
+
+
+    train_docs   = [documents[i] for i in train_idx]
+    test_docs    = [documents[i] for i in test_idx]
+    train_labels = labels[train_idx]
+    test_labels  = labels[test_idx]
+    "split"
 
     # word selection
     top_words = build_keywords_per_class(train_docs, train_labels)
     print(f"{len(top_words)} LLM keywords gathered.")
 
-    cleaned_docs = [
-        [w for w in re.sub(r"\W+", " ", d.lower()).split() if w in top_words]
-        for d in train_docs
-    ]
+    cleaned_docs = []
+    for doc in train_docs:
+        words = clean_data(doc)
+        cleaned_docs.append(words)
 
     idf = {
         w: math.log(len(cleaned_docs) / (1 + sum(w in doc for doc in cleaned_docs)))
