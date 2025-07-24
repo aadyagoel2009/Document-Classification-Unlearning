@@ -1,3 +1,10 @@
+
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+import multiprocessing as mp
+mp.set_start_method("spawn", force=True)
+
 import networkx as nx
 import numpy as np
 from collections import defaultdict, Counter
@@ -14,7 +21,8 @@ from sklearn.datasets import fetch_20newsgroups
 import os, json
 from functools import lru_cache
 from keybert import KeyBERT
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, util
+
 
 # ------------------------
 # Word Selection
@@ -22,8 +30,7 @@ from sentence_transformers import SentenceTransformer
 
 #Hyperparameters 
 EMB_MODEL          = "sentence-transformers/all-MiniLM-L6-v2"
-DOCS_PER_CLASS     = 200                     # #docs shown to LLM
-KEYWORDS_PER_CLASS = 300                     # words returned per class
+KEYWORDS_PER_CLASS = 4000                     # words returned per class
 ENT_MIN, ENT_MAX   = 1.0, 4.0                # entropy gate 
 
 kw_model = KeyBERT(EMB_MODEL)
@@ -33,13 +40,6 @@ def char_entropy(word):
     total = len(word)
     return -sum((c/total)*math.log((c/total)+1e-12) for c in counts.values())
 
-def _sample_docs(docs, labels, cls, n=DOCS_PER_CLASS, seed=42):
-    """Randomly pick up to n docs of a given class."""
-    idx = [i for i, l in enumerate(labels) if l == cls]
-    rng = np.random.default_rng(seed)
-    take = rng.choice(idx, size=min(n, len(idx)), replace=False)
-    return [docs[i] for i in take]
-
 def build_keywords_per_class(train_docs, train_labels):
     """Return the union of KEYWORDS_PER_CLASS discriminative tokens per class."""
     class_names  = fetch_20newsgroups(subset="all").target_names
@@ -47,26 +47,24 @@ def build_keywords_per_class(train_docs, train_labels):
 
     for cls, name in enumerate(class_names):
         # 1 ) gather training docs for this class
-        sample_docs = _sample_docs(train_docs, train_labels, cls)
-        joined      = "\n".join(sample_docs)
+        freq = Counter()
+        class_ids = [d for d, l in enumerate(train_labels) if l == cls]
+        class_docs = [train_docs[i] for i in class_ids]
 
-        # 2 ) KeyBERT: return (keyword, score) tuples
-        kw_scores = kw_model.extract_keywords(
-            joined,
-            keyphrase_ngram_range=(1, 3),
-            stop_words="english",
-            nr_candidates=KEYWORDS_PER_CLASS * 4,  
-            top_n=KEYWORDS_PER_CLASS * 2, 
-            use_maxsum=True,                        
-        )
-
-        # 3 ) clean & keep first KEYWORDS_PER_CLASS tokens
-        picks = {
-            w.lower() for w, _ in kw_scores
-            if ENT_MIN <= char_entropy(w) <= ENT_MAX and w.isascii()
-        }
+        for doc in class_docs:
+            # 2 ) KeyBERT: return (keyword, score) tuples
+            kw_scores = kw_model.extract_keywords(
+                doc,
+                keyphrase_ngram_range=(1, 3),
+                stop_words="english",
+                top_n=100, 
+                use_mmr=True,   
+                diversity = 0.7                     
+            )
+            freq.update(w.lower() for w, _ in kw_scores if ENT_MIN <= char_entropy(w) <= ENT_MAX and w.isascii())
+        
         # ensure exactly KEYWORDS_PER_CLASS per class
-        keywords_by_class[cls] = set(list(picks)[:KEYWORDS_PER_CLASS])
+        keywords_by_class[cls] = set([w for w, _ in freq.most_common(KEYWORDS_PER_CLASS)])
 
     top_words = sorted(set().union(*keywords_by_class.values()))
     return top_words
@@ -110,35 +108,51 @@ def create_class_importance_nodes(G, labels, alpha=0):
 # ------------------------
 # Classifier & Unlearning
 # ------------------------
-def train_classifier(imp, idf):
+def train_classifier(imp, word_embeddings, embed_model, idf):
     def clean_data(text):
         text = re.sub(r"\W+", " ", text.lower())
         words = [w for w in text.split() if w.isalpha() and len(w)>=3]
         return [w for w in words if 1.0 <= char_entropy(w) <= 4.0]
-
+    
     def softmax(logits):
         shifted = logits - np.max(logits)
         exp_shifted = np.exp(shifted)
         return exp_shifted / exp_shifted.sum()
-
+    
     def classify(doc):
+        raw = embed_model.encode(
+            doc[:embed_model.max_seq_length],
+            convert_to_numpy=True
+        )
+        norm = np.linalg.norm(raw)
+        doc_emb = raw/norm if norm>0 else raw
+
         tf = Counter(clean_data(doc))
         vec = np.zeros(len(next(iter(imp.values()))))
-        
+
         for w, count in tf.items():
             if w in imp:
+                sim = float(np.dot(doc_emb, word_embeddings[w]))
+                sim = max(sim, 0.0)
+
                 tf_log    = 1 + math.log(count)
                 idf_clamp = min(max(idf[w], 0.5), 3.0)
-                weight  = tf_log * idf_clamp
+
+                weight = sim * tf_log * idf_clamp
+
                 vec += weight * np.array(imp[w])
-        if vec.sum()== 0: return 0, vec.tolist()
-        
+
+        # fallback if no words matched
+        if vec.sum() == 0:
+            return 0, vec.tolist()
+
         probs = softmax(vec)
         u = random.random()        
         cumulative_probs = np.cumsum(probs)        
         pred = int(np.searchsorted(cumulative_probs, u))
         return pred, probs
-    
+
+
     return classify
 
 def zero_class_importance(importances, cls):
@@ -159,7 +173,7 @@ def tsne_visualization(cleaned_docs, labels, class_importances, class_to_unlearn
         emb.append(vec)
         cols.append('red' if labels[i]==class_to_unlearn else 'blue')
     emb = np.array(emb)
-    proj = TSNE(n_components=2, random_state=42).fit_transform(emb)
+    proj = TSNE(n_components=2, init="random", random_state=42, n_jobs=1).fit_transform(emb)
     plt.figure(figsize=(8,6))
     plt.scatter(proj[:,0], proj[:,1], c=cols, alpha=0.6)
     plt.title(f"t-SNE (class {class_to_unlearn} in red)")
@@ -203,7 +217,6 @@ def main():
     test_docs = documents[split_index:]
     train_labels = labels[:split_index]
     test_labels = labels[split_index:]
-    print("all partition done")
 
     # word selection
     top_words = build_keywords_per_class(train_docs, train_labels)
@@ -221,11 +234,20 @@ def main():
 
     # graph & importance
     graph_of_doc = build_word_document_graph(cleaned_docs, train_labels, top_words)
-    print("graph built")
     class_importances = create_class_importance_nodes(graph_of_doc, train_labels)
-    print("importances created")
-    classify_document = train_classifier(class_importances, idf)
-    print("classifier trained")
+
+    embed_model = SentenceTransformer(EMB_MODEL)
+    embed_model.max_seq_length = 512
+    word_embeddings = {}
+    for w in top_words:
+        emb = embed_model.encode(w, convert_to_numpy=True)    # -> np.ndarray
+        norm = np.linalg.norm(emb)
+        if norm > 0:
+            emb = emb / norm
+        word_embeddings[w] = emb
+
+
+    classify_document = train_classifier(class_importances, word_embeddings, embed_model, idf)
 
     # evaluate before unlearning
     test_pred = [classify_document(d)[0] for d in test_docs]
@@ -240,7 +262,7 @@ def main():
 
     # zero class importance
     zero_class_importance(class_importances, class_to_unlearn)
-    classify_document = train_classifier(class_importances, idf)
+    classify_document = train_classifier(class_importances, word_embeddings, embed_model, idf)
     print("retrain classifier")
 
     test_pred = [classify_document(d)[0] for d in test_docs]
